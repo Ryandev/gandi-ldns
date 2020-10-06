@@ -2,43 +2,70 @@
 
 
 from urllib.parse import urljoin
-
-import configparser
-
 import sys
-
 import os
-
 import socket
-
 import requests
 
+def get_env_variable(name, defaultvalue=''):
+    """Get variable set in environment otherwise fallback to #defaultvalue"""
 
-def get_zone_ip(section):
-    """Get the current IP from the A record in the DNS zone """
+    val = os.environ.get(name)
+    if val == None:
+        val = defaultvalue
+    return val
 
-    endpoint = 'domains/%s/records' % section['domain']
-    api_url = urljoin(section['api'], endpoint)
+def get_domain_records(domain, apiurl, apikey):
+    """Get all records in the DNS zone """
+
+    endpoint = 'domains/%s/records' % domain
+    urlfetch = urljoin(apiurl, endpoint)
 
     ip = '0.0.0.0'
 
-    resp = requests.get(api_url, headers={'X-Api-Key': section['apikey']})
+    resp = requests.get(urlfetch, headers={'X-Api-Key': apikey})
     resp.raise_for_status()
 
-    current_zone = resp.json()
-    name = section['a_name']
+    return resp.json()
 
-    # There may be more than one A record - we're interested in one with
-    # the specific name (typically @ but could be sub domain)
-    for record in current_zone:
-        if record['rrset_type'] == 'A'and record['rrset_name'] == name:
-            ip = record['rrset_values'][0]
-            break
+def update_domain_record(domain, apiurl, apikey, matchtype, matchname, value, ttl=10800):
+    endpoint = 'domains/%s/records/%s/%s' % (domain, matchname, matchtype)
+    puturl = urljoin(apiurl, endpoint)
 
-    return ip
+    body = {
+        'rrset_ttl': ttl,
+        'rrset_values': [value,],
+    }
+    print(body)
+    resp = requests.put(puturl, json=body, headers={'X-Api-Key': apikey})
+    resp.raise_for_status()
 
+def filter_domain_records(recordsIn, searchkey, searchval):
+    recordsout=[]
+    for record in recordsIn:
+        if record[searchkey] == searchval:
+            recordsout.append(record)
+    return recordsout
 
-def get_ip():
+def get_zone_ip(domain, apiurl, apikey):
+    """Get the current IP from the A record in the DNS zone """
+
+    # # There may be more than one A record - we're interested in one with
+    # # the specific name (typically @ but could be sub domain)
+    domain_records = get_domain_records(domain, apiurl, apikey)
+    domain_records = filter_domain_records(domain_records, 'rrset_type', 'A')
+    domain_records = filter_domain_records(domain_records, 'rrset_name', '@')
+    if len(domain_records) > 0:
+        return domain_records[0]['rrset_values'][0]
+    else:
+        return None
+
+def set_zone_ip(domain, apiurl, apikey, newip, ttl):
+    """ Update Gandi record A=#newip """
+
+    update_domain_record(domain=domain, apiurl=apiurl, apikey=apikey, matchtype='A', matchname='@', value=newip, ttl=ttl)
+
+def get_public_ip():
     """ Get external IP """
 
     try:
@@ -52,55 +79,35 @@ def get_ip():
     return resp.text
 
 
-def change_zone_ip(section, new_ip):
-    """ Change the zone record to the new IP """
-
-    a_name = section['a_name']
-    domain = section['domain']
-    apikey = section['apikey']
-
-    endpoint = 'domains/%s/records/%s/%s' % (domain, a_name, 'A')
-    api_url = urljoin(section['api'], endpoint)
-
-    body = {
-        'rrset_ttl': section.getint('ttl'),
-        'rrset_values': [new_ip,],
-    }
-
-    resp = requests.put(api_url, json=body, headers={'X-Api-Key': apikey})
-    resp.raise_for_status()
-
-
-def read_config(config_path):
-    """ Open the configuration file or create it if it doesn't exists """
-    if not os.path.exists(config_path):
-        return None
-    cfg = configparser.ConfigParser()
-    cfg.read(config_path)
-    return cfg
-
-
 def main():
-    SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
-    path = os.path.join(SCRIPT_DIR, 'config.txt')
-    config = read_config(path)
-    if not config:
-        sys.exit("please fill in the 'config.txt' file")
+    current_ip = get_public_ip().strip()
 
-    for section in config.sections():
-        zone_ip = get_zone_ip(config[section])
-        current_ip = socket.gethostbyname(config.get(section, "host"))
-        if current_ip == '127.0.0.1':
-            current_ip = get_ip()
+    apikey = get_env_variable('APIKEY', None)
+    apiurl = get_env_variable('APIURL', 'https://dns.api.gandi.net/api/v5/')
+    ttl = get_env_variable('TTL', 10800)
+    domain = get_env_variable('DOMAIN', None)
 
-        if zone_ip.strip() == current_ip.strip():
-            continue
-        else:
-            print('DNS Mistmatch detected: A-record: ',
-                  zone_ip, ' WAN IP: ', current_ip)
-            change_zone_ip(config[section], current_ip)
-            zone_ip = get_zone_ip(config[section])
-            print('DNS A record update complete - set to ', zone_ip)
+    if apikey == None:
+        print('Missing \'APIKEY\' from env. See https://docs.gandi.net/en/domain_names/advanced_users/api.html')
+        sys.exit(1)
+
+    if domain == None:
+        print('Missing \'DOMAIN\' from env. Set this to the website we\'re updating')
+        sys.exit(1)
+
+    zone_ip = get_zone_ip(domain=domain, apiurl=apiurl, apikey=apikey).strip()
+
+    if zone_ip == current_ip:
+        print('Record up to date, returning ('+zone_ip+')')
+    else:
+        print('Updating record to ('+zone_ip+')')
+        set_zone_ip(
+            domain=domain, 
+            apiurl=apiurl, 
+            apikey=apikey, 
+            newip=current_ip,
+            ttl=ttl)
+        print('DNS A record update complete - set to ', zone_ip)
 
 
 if __name__ == "__main__":
